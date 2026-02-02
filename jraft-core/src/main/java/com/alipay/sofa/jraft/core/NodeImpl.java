@@ -633,6 +633,7 @@ public class NodeImpl implements Node, RaftServerService {
             if (isCurrentLeaderValid()) {
                 return;
             }
+            // 重置leader节点，设置为空 -> 通知状态机 onStopFollowing
             resetLeaderId(PeerId.emptyPeer(), new Status(RaftError.ERAFTTIMEDOUT, "Lost connection from leader %s.",
                 this.leaderId));
 
@@ -1297,6 +1298,13 @@ public class NodeImpl implements Node, RaftServerService {
         this.stepDownTimer.start();
     }
 
+    /**
+     * 将节点从 LEADER 或 CANDIDATE 状态退回到 FOLLOWER 状态。
+     *
+     * @param term
+     * @param wakeupCandidate
+     * @param status
+     */
     // should be in writeLock
     private void stepDown(final long term, final boolean wakeupCandidate, final Status status) {
         LOG.debug("Node {} stepDown, term={}, newTerm={}, wakeupCandidate={}.", getNodeId(), this.currTerm, term,
@@ -1305,6 +1313,7 @@ public class NodeImpl implements Node, RaftServerService {
             return;
         }
         if (this.state == State.STATE_CANDIDATE) {
+            // 候选者调用此方法是因为投票超时了，需要将自身状态降级到 follower 进行预投票，所以需要先暂停 voteTimer
             stopVoteTimer();
         } else if (this.state.compareTo(State.STATE_TRANSFERRING) <= 0) {
             stopStepDownTimer();
@@ -1318,6 +1327,7 @@ public class NodeImpl implements Node, RaftServerService {
         resetLeaderId(PeerId.emptyPeer(), status);
 
         // soft state in memory
+        // 退回到 FOLLOWER
         this.state = State.STATE_FOLLOWER;
         this.confCtx.reset();
         updateLastLeaderTimestamp(Utils.monotonicMs());
@@ -1382,6 +1392,7 @@ public class NodeImpl implements Node, RaftServerService {
         @Override
         public void run(final Status status) {
             if (status.isOk()) {
+                // firstLogIndex 在 com.alipay.sofa.jraft.storage.LogManager.appendEntries 中设置
                 NodeImpl.this.ballotBox.commitAt(this.firstLogIndex, this.firstLogIndex + this.nEntries - 1,
                     NodeImpl.this.serverId);
             } else {
@@ -1392,6 +1403,7 @@ public class NodeImpl implements Node, RaftServerService {
     }
 
     private void executeApplyingTasks(final List<LogEntryAndClosure> tasks) {
+        // 检查日志存储是否有足够空间。如果满了，立即拒绝所有任务并返回错误。
         if (!this.logManager.hasAvailableCapacityToAppendEntries(1)) {
             // It's overload, fail-fast
             final List<Closure> dones = tasks.stream().map(ele -> ele.done).filter(Objects::nonNull)
@@ -1438,6 +1450,7 @@ public class NodeImpl implements Node, RaftServerService {
                     }
                     continue;
                 }
+                // 1. 添加到投票箱中，因为 writeLock，日志与 done 是一一对应的
                 if (!this.ballotBox.appendPendingTask(this.conf.getConf(),
                     this.conf.isStable() ? null : this.conf.getOldConf(), task.done)) {
                     ThreadPoolsFactory.runClosureInThread(this.groupId, task.done, new Status(RaftError.EINTERNAL, "Fail to append task."));
@@ -1450,6 +1463,7 @@ public class NodeImpl implements Node, RaftServerService {
                 entries.add(task.entry);
                 task.reset();
             }
+            // 2. 添加到本机日志中
             this.logManager.appendEntries(entries, new LeaderStableClosure(entries));
             // update conf.first
             checkAndSetConfiguration(true);
@@ -1599,6 +1613,7 @@ public class NodeImpl implements Node, RaftServerService {
         final int quorum = getQuorum();
         if (quorum <= 1) {
             // Only one peer, fast path.
+            // leader 节点直接读取当前节点的 commitIndex
             respBuilder.setSuccess(true) //
                 .setIndex(this.ballotBox.getLastCommittedIndex());
             closure.setResponse(respBuilder.build());
@@ -1606,6 +1621,8 @@ public class NodeImpl implements Node, RaftServerService {
             return;
         }
 
+        // lastCommittedIndex 不是当前任期内的日志，直接拒绝读取，这里并没有提交一个空的op来推进commitIndex，而是直接快速失败
+        // 失败后交给业务方决定是否要提交一个OP来推进commitIndex，这里raft并没有做这个事情（猜测是raft状态机没法知道空OP是什么以及怎么在状态机应用）
         final long lastCommittedIndex = this.ballotBox.getLastCommittedIndex();
         if (this.logManager.getTerm(lastCommittedIndex) != this.currTerm) {
             // Reject read only request when this leader has not committed any log entry at its term
@@ -1616,6 +1633,7 @@ public class NodeImpl implements Node, RaftServerService {
                     lastCommittedIndex, this.currTerm));
             return;
         }
+        // 设置 commitIndex，表示这个 readIndex 请求至少要等待 lastCommittedIndex 完全应用后才能读取
         respBuilder.setIndex(lastCommittedIndex);
 
         if (request.getPeerId() != null) {
@@ -1629,6 +1647,8 @@ public class NodeImpl implements Node, RaftServerService {
             }
         }
 
+        // read lease 但是不在leader续约周期内（可能有其他节点当选了leader）退化为 read index
+        // read index 最主要主要保证当前节点是 leader 节点，否则可能读取到旧数据（比如 leader 节点分区）
         ReadOnlyOption readOnlyOpt = ReadOnlyOption.valueOfWithDefault(request.getReadOnlyOptions(),
             this.raftOptions.getReadOnlyOptions());
         if (readOnlyOpt == ReadOnlyOption.ReadOnlyLeaseBased && !isLeaderLeaseValid()) {
@@ -1643,6 +1663,7 @@ public class NodeImpl implements Node, RaftServerService {
                 final ReadIndexHeartbeatResponseClosure heartbeatDone = new ReadIndexHeartbeatResponseClosure(closure,
                     respBuilder, quorum, peers.size());
                 // Send heartbeat requests to followers
+                // 发送心跳给 follower 节点确认自己的 leader 身份
                 for (final PeerId peer : peers) {
                     if (peer.equals(this.serverId)) {
                         continue;
@@ -1651,6 +1672,7 @@ public class NodeImpl implements Node, RaftServerService {
                 }
                 break;
             case ReadOnlyLeaseBased:
+                // 当前一定是 leader，可以直接使用当前节点的数据
                 // Responses to followers and local node.
                 respBuilder.setSuccess(true);
                 closure.setResponse(respBuilder.build());
@@ -1780,6 +1802,13 @@ public class NodeImpl implements Node, RaftServerService {
         return checkLeaderLease(monotonicNowMs);
     }
 
+    /**
+     * 检查是否在leader续约周期内
+     * 当前时间 - lastLeaderTimestamp < leader续约周期（默认是选举超时的90%）
+     *
+     * @param monotonicNowMs
+     * @return
+     */
     private boolean checkLeaderLease(final long monotonicNowMs) {
         return monotonicNowMs - this.lastLeaderTimestamp < this.options.getLeaderLeaseTimeoutMs();
     }
@@ -2271,6 +2300,16 @@ public class NodeImpl implements Node, RaftServerService {
         return false;
     }
 
+    /**
+     * 检查当前leader是否在续约期内
+     * 超过半数节点 当前时间 - 最后一次rpc的时间 < leaderLeaseTimeoutMs
+     *
+     * @param peers
+     * @param monotonicNowMs
+     * @param checkReplicator
+     * @param deadNodes
+     * @return
+     */
     private boolean checkDeadNodes0(final List<PeerId> peers, final long monotonicNowMs, final boolean checkReplicator,
                                     final Configuration deadNodes) {
         final int leaderLeaseTimeoutMs = this.options.getLeaderLeaseTimeoutMs();
@@ -2705,6 +2744,31 @@ public class NodeImpl implements Node, RaftServerService {
         }
     }
 
+    /**
+     * Pre-Vote（预投票）是 Raft 协议的一项增强机制，在正式选举前进行试探性投票，
+     * 用于防止因节点短暂失联（如网络抖动、GC 停顿）而误触发高任期选举，进而导致健康 Leader 被迫退位。
+     *
+     * <p>流程如下：
+     * <ul>
+     *   <li>Follower 触发选举超时后，不立即递增 currentTerm，而是以 {@code currentTerm + 1} 发起 Pre-Vote 请求；</li>
+     *   <li>其他节点收到后，仅判断“若进入该新任期是否愿意投票”，但不更新自身状态（不修改 term，不切换角色）；</li>
+     *   <li>若获得多数派 Pre-Vote 响应，则正式：
+     *     <ul>
+     *       <li>递增 currentTerm，</li>
+     *       <li>转为 Candidate，</li>
+     *       <li>发起 RequestVote；</li>
+     *     </ul>
+     *   </li>
+     *   <li>否则，放弃本次选举，继续等待心跳。</li>
+     * </ul>
+     *
+     * <p>核心作用：
+     * <ul>
+     *   <li>避免无意义的高 term 请求；</li>
+     *   <li>保护健康 Leader 不被误退位；</li>
+     *   <li>提升系统稳定性，减少选举风暴。</li>
+     * </ul>
+     */
     // in writeLock
     private void preVote() {
         long oldTerm;
@@ -2757,6 +2821,7 @@ public class NodeImpl implements Node, RaftServerService {
                 this.rpcService.preVote(peer.getEndpoint(), done.request, done);
             }
             this.prevVoteCtx.grant(this.serverId);
+            // 如果有超过一半的节点批准了这次预投票，则开始实际的投票
             if (this.prevVoteCtx.isGranted()) {
                 doUnlock = false;
                 electSelf();

@@ -555,6 +555,7 @@ public class RocksDBLogStorage implements LogStorage, Describer {
                     addDataBatch(entry, batch, writeCtx);
                 }
             }
+            // 等待所有事件完成 -> 进行刷盘处理
             writeCtx.joinAll();
             doSync();
         });

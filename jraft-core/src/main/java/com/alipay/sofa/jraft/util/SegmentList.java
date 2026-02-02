@@ -400,6 +400,7 @@ public class SegmentList<T extends SegmentList.EstimatedSize> {
 
         int toIndexInSeg = alignedIndex & (SEGMENT_SIZE - 1);
 
+        // 移除 toSegmentIndex 之前的完整 segment
         if (toSegmentIndex > 0) {
             for (int i = 0; i < toSegmentIndex; i++) {
                 this.estimatedBytes -= this.segments.get(i).bytes();
@@ -408,8 +409,10 @@ public class SegmentList<T extends SegmentList.EstimatedSize> {
             this.size -= ((toSegmentIndex << SEGMENT_SHIFT) - this.firstOffset);
         }
 
+        // 获取到未删除的第一个 segment，不包含👆🏻已经删除的 segment
         Segment<T> firstSeg = this.getFirst();
         if (firstSeg != null) {
+            // 移除这个 segment 下 offset 到 toIndexInSeg 之间的数据
             long[] results = firstSeg.removeFromFirst(toIndexInSeg);
             this.size -= (int) results[0];
             this.estimatedBytes -= results[1];

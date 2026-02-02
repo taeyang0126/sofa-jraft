@@ -170,6 +170,7 @@ public class ReadOnlyServiceImpl implements ReadOnlyService, LastAppliedLogIndex
         @Override
         public void run(final Status status) {
             if (!status.isOk()) {
+                // 通知所有命令的回调失败
                 notifyFail(status);
                 return;
             }
@@ -183,24 +184,33 @@ public class ReadOnlyServiceImpl implements ReadOnlyService, LastAppliedLogIndex
                 readIndexResponse.getIndex());
             for (final ReadIndexState state : this.states) {
                 // Records current commit log index.
+                // 设置当前leader的 commitIndex
                 state.setIndex(readIndexResponse.getIndex());
             }
 
             boolean doUnlock = true;
             ReadOnlyServiceImpl.this.lock.lock();
             try {
+                // 判断 lastAppliedIndex >= commitIndex 也就是所有提交的日志都应用了
                 if (readIndexStatus.isApplied(ReadOnlyServiceImpl.this.fsmCaller.getLastAppliedIndex())) {
                     // Already applied, notify readIndex request.
                     ReadOnlyServiceImpl.this.lock.unlock();
                     doUnlock = false;
                     notifySuccess(readIndexStatus);
                 } else {
+                    // 读取索引时，需要比较当前节点的应用索引与领导者的提交索引。只有当当前节点的应用索引追上领导者的提交索引时，才会调用读取索引回调函数并返回成功。
+                    // 因此，会存在一定的等待时间。默认的等待超时时间为 2 秒。这意味着如果等待时间超过 2 秒，则会调用读取索引回调函数并返回失败。
+                    // 如果当前节点出现问题，其应用索引可能会落后于领导者的提交索引。在读取索引超时的情况下，它无法追上领导者的提交索引，导致超时等待白白浪费。
+                    // 为此，我们提供了一个配置项来解决这个问题。如果两者之间的差距大于 maxReadIndexLag，则会快速失败，并调用读取索引回调函数返回失败。
+                    // 这里默认 maxReadIndexLag = -1，表示不检查leader节点的commitIndex和当前节点的应用索引之间的差值
                     if (readIndexStatus.isOverMaxReadIndexLag(ReadOnlyServiceImpl.this.fsmCaller.getLastAppliedIndex(), ReadOnlyServiceImpl.this.raftOptions.getMaxReadIndexLag())) {
                         ReadOnlyServiceImpl.this.lock.unlock();
                         doUnlock = false;
                         notifyFail(new Status(-1, "Fail to run ReadIndex task, the gap of current node's apply index between leader's commit index over maxReadIndexLag"));
                     } else  {
                         // Not applied, add it to pending-notify cache.
+                        // 尚未应用到最新的commitIndex，直接添加到 pendingNotifyStatus 中，等待应用成功的回调来处理这些请求
+                        // todo-wl 目前没看到最多等待2秒的配置
                         ReadOnlyServiceImpl.this.pendingNotifyStatus
                             .computeIfAbsent(readIndexStatus.getIndex(), k -> new ArrayList<>(10)) //
                             .add(readIndexStatus);

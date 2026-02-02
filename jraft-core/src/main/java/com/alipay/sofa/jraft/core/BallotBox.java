@@ -48,10 +48,14 @@ public class BallotBox implements Lifecycle<BallotBoxOptions>, Describer {
     private static final Logger       LOG                = LoggerFactory.getLogger(BallotBox.class);
 
     private FSMCaller                 waiter;
+    // 用户的回调闭包
     private ClosureQueue              closureQueue;
     private final StampedLock         stampedLock        = new StampedLock();
+    // 最后已提交的日志索引
     private long                      lastCommittedIndex = 0;
+    // 待提交日志的起始索引
     private long                      pendingIndex;
+    // 每个日志的投票状态队列
     private final SegmentList<Ballot> pendingMetaQueue   = new SegmentList<>(false);
     private BallotBoxOptions          opts;
 
@@ -201,6 +205,7 @@ public class BallotBox implements Lifecycle<BallotBoxOptions>, Describer {
      * @return          returns true on success
      */
     public boolean appendPendingTask(final Configuration conf, final Configuration oldConf, final Closure done) {
+        // 1. 创建 Ballot 对象（投票箱）-> 计算需要多少票数才能通过
         final Ballot bl = new Ballot();
         if (!bl.init(conf, oldConf)) {
             LOG.error("Fail to init ballot.");
@@ -212,7 +217,10 @@ public class BallotBox implements Lifecycle<BallotBoxOptions>, Describer {
                 LOG.error("Node {} fail to appendingTask, pendingIndex={}.", this.opts.getNodeId(), this.pendingIndex);
                 return false;
             }
+            // 以下两个队列按相同顺序存储，索引一一对应
+            // 2. 将 Ballot 加入投票队列（与日志条目一一对应）
             this.pendingMetaQueue.add(bl);
+            // 3. 将用户的回调闭包加入回调队列
             this.closureQueue.appendPendingClosure(done);
             return true;
         } finally {

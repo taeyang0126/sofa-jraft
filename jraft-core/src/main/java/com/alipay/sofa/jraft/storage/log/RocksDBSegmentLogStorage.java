@@ -659,6 +659,7 @@ public class RocksDBSegmentLogStorage extends RocksDBLogStorage {
         LOG.info("SegmentAllocator is started.");
         while (!Thread.currentThread().isInterrupted()) {
             doAllocateSegmentInLock();
+            // 内存中只保存 3 个 segment，多余 mmap 卸载掉
             doSwapOutSegments(false);
         }
         LOG.info("SegmentAllocator exit.");
@@ -697,12 +698,15 @@ public class RocksDBSegmentLogStorage extends RocksDBLogStorage {
             int swappedOutCount = 0;
             final long beginTime = Utils.monotonicMs();
             final int lastIndex = this.segments.size() - 1;
+            // 从最新的文件往前进行处理 -> 将旧的 mmap 卸载掉，减少对最新数据的影响
             for (int i = lastIndex; i >= 0; i--) {
                 SegmentFile segFile = this.segments.get(i);
                 if (!segFile.isSwappedOut()) {
                     segmentsInMemeCount++;
                     if (segmentsInMemeCount >= this.keepInMemorySegmentCount && i != lastIndex) {
+                        // 卸载物理内存页（Page Cache），保留虚拟映射，访问可恢复
                         segFile.hintUnload();
+                        // 卸载虚拟内存映射（VMA），彻底释放资源，访问将失败
                         segFile.swapOut();
                         swappedOutCount++;
                     }
@@ -1073,6 +1077,44 @@ public class RocksDBSegmentLogStorage extends RocksDBLogStorage {
         return new BarrierWriteContext();
     }
 
+    /**
+     * 追加数据时的钩子方法，根据数据大小选择存储策略。
+     *
+     * <p><b>存储策略选择：</b>
+     * <table border="1" cellpadding="2" cellspacing="0">
+     *   <tr><th>数据大小</th><th>存储位置</th><th>原因</th></tr>
+     *   <tr>
+     *     <td>&lt; {@code valueSizeThreshold}（默认 4KB）</td>
+     *     <td>RocksDB</td>
+     *     <td>
+     *       <ul>
+     *         <li>压缩效果好：Block 压缩对小值效率高</li>
+     *         <li>缓存友好：充分利用 Block Cache，不影响其他数据</li>
+     *         <li>零额外开销：无需 mmap 和文件管理</li>
+     *       </ul>
+     *     </td>
+     *   </tr>
+     *   <tr>
+     *     <td>&ge; {@code valueSizeThreshold}</td>
+     *     <td>SegmentFile</td>
+     *     <td>
+     *       <ul>
+     *         <li>避免污染缓存：大值不会挤占 Block Cache</li>
+     *         <li>mmap 零拷贝：直接内存映射访问，无需系统调用</li>
+     *         <li>内存可控：通过 madvise 主动换出，精确控制内存</li>
+     *         <li>RocksDB 只存 14 字节元数据作为索引</li>
+     *       </ul>
+     *     </td>
+     *   </tr>
+     * </table>
+     *
+     * @param logIndex 日志索引
+     * @param value 日志条目的原始数据
+     * @param ctx 写入上下文，用于异步任务协调
+     * @return 小值返回原数据，大值返回位置元数据（firstLogIndex + position）
+     * @throws IOException 数据超过单文件大小时抛出
+     * @throws InterruptedException 异步任务被中断时抛出
+     */
     @Override
     protected byte[] onDataAppend(final long logIndex, final byte[] value, final WriteContext ctx) throws IOException,
                                                                                                   InterruptedException {
@@ -1082,6 +1124,7 @@ public class RocksDBSegmentLogStorage extends RocksDBLogStorage {
             throw new IOException("Too large value size: " + value.length + ", maxSegmentFileSize="
                                   + this.maxSegmentFileSize);
         }
+        // 默认 < 4KB 直接存储在rocksdb中
         if (value.length < this.valueSizeThreshold) {
             // Small value will be stored in rocksdb directly.
             lastSegmentFile.setLastLogIndex(logIndex);
@@ -1089,6 +1132,7 @@ public class RocksDBSegmentLogStorage extends RocksDBLogStorage {
             return value;
         }
         // Large value is stored in segment file and returns an encoded location info that will be stored in rocksdb.
+        // 大值存储在段文件中，并返回一个编码后的定位信息，该信息将存储在rocksdb中。
         final int pos = lastSegmentFile.write(logIndex, value, ctx);
         final long firstLogIndex = lastSegmentFile.getFirstLogIndex();
         return encodeLocationMetadata(firstLogIndex, pos);
@@ -1108,6 +1152,7 @@ public class RocksDBSegmentLogStorage extends RocksDBLogStorage {
      */
     private byte[] encodeLocationMetadata(final long firstLogIndex, final int pos) {
         final byte[] newData = new byte[LOCATION_METADATA_SIZE];
+        // 魔数
         System.arraycopy(SegmentFile.RECORD_MAGIC_BYTES, 0, newData, 0, SegmentFile.RECORD_MAGIC_BYTES_SIZE);
         // 2 bytes reserved
         Bits.putLong(newData, SegmentFile.RECORD_MAGIC_BYTES_SIZE + 2, firstLogIndex);
@@ -1189,10 +1234,13 @@ public class RocksDBSegmentLogStorage extends RocksDBLogStorage {
 
     @Override
     protected byte[] onDataGet(final long logIndex, final byte[] value) throws IOException {
+        // 1. value 的长度不等于元数据的长度 -> 元数据存放在 rocksdb 中，实际数据在 segmentFile 中
+        // 说明 rocksdb 存放的就是实际的数据
         if (value == null || value.length != LOCATION_METADATA_SIZE) {
             return value;
         }
 
+        // 2. 验证魔数
         int offset = 0;
         for (; offset < SegmentFile.RECORD_MAGIC_BYTES_SIZE; offset++) {
             if (value[offset] != SegmentFile.RECORD_MAGIC_BYTES[offset]) {
@@ -1203,12 +1251,16 @@ public class RocksDBSegmentLogStorage extends RocksDBLogStorage {
         // skip reserved
         offset += 2;
 
+        // firstLogIndex -> SegmentFile 中存放的此文件第一个 Log 对应的 index
         final long firstLogIndex = Bits.getLong(value, offset);
+        // 获取对应文件中的 pos（起始位置）
         final int pos = Bits.getInt(value, offset + 8);
+        // 二分法搜索 firstLogIndex -> 对应的 SegmentFile
         final SegmentFile file = binarySearchFileByFirstLogIndex(firstLogIndex);
         if (file == null) {
             return null;
         }
+        // 读取具体文件中的日志
         return file.read(logIndex, pos);
     }
 }

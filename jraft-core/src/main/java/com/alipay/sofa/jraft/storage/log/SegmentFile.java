@@ -199,6 +199,8 @@ public class SegmentFile implements Lifecycle<SegmentFileOptions> {
 
     /**
      * Magic bytes for data buffer.
+     * 0x57 = 87
+     * 0x8A = -118
      */
     public static final byte[]       RECORD_MAGIC_BYTES      = new byte[] { (byte) 0x57, (byte) 0x8A };
 
@@ -359,6 +361,11 @@ public class SegmentFile implements Lifecycle<SegmentFileOptions> {
         }
     }
 
+    /**
+     * hintUnload: 通过 madvise(MADV_DONTNEED) 释放物理内存页，
+     *             保留虚拟映射，后续访问自动从磁盘重载。
+     *             仅适用于已持久化的只读数据，避免 unmap 前的潜在 I/O 延迟。
+     */
     public void hintUnload() {
         Pointer pointer = getPointer();
 
@@ -370,6 +377,18 @@ public class SegmentFile implements Lifecycle<SegmentFileOptions> {
         }
     }
 
+    /**
+     * 解除指定 {@link MappedByteBuffer} 的内存映射，释放操作系统级资源。
+     * <p>
+     * 即使 mmap 的 clean page 不会长期占用物理内存，
+     * 若不主动 unmap，仍可能导致：
+     * <ul>
+     *   <li>耗尽虚拟内存区域（VMA），触发 Linux 的 {@code vm.max_map_count} 限制（默认 65530）</li>
+     *   <li>在 Windows 上文件被锁定，无法删除或重命名</li>
+     *   <li>写密集场景下 dirty pages 积累，增加内存与 I/O 压力</li>
+     * </ul>
+     * 此操作对长期运行、大量使用 mmap 的系统而言是必需的，而非可选优化。
+     */
     public void swapOut() {
         if (!this.swappedOut) {
             this.writeLock.lock();
@@ -377,10 +396,12 @@ public class SegmentFile implements Lifecycle<SegmentFileOptions> {
                 if (this.swappedOut) {
                     return;
                 }
+                // 可写 mmap 文件可能包含未刷盘的脏页，直接 unmap 会导致数据丢失。
                 if (!this.readOnly) {
                     LOG.warn("The segment file {} is not readonly, can't be swapped out.", this.path);
                     return;
                 }
+                // 防频繁换出（冷却时间）<- 1 分钟内刚换过就不再换出
                 final long now = Utils.monotonicMs();
                 if (this.swappedOutTimestamp > 0 && now - this.swappedOutTimestamp < ONE_MINUTE) {
                     return;
@@ -464,8 +485,11 @@ public class SegmentFile implements Lifecycle<SegmentFileOptions> {
     @Override
     public boolean init(final SegmentFileOptions opts) {
         if (opts.isNewFile) {
+            // 会创建新文件 & 不能是 recover 模式
             return loadNewFile(opts);
         } else {
+            // 加载已存在的文件 -> mmap
+            // 如果是 recover -> recover()
             return loadExistsFile(opts);
         }
 
@@ -631,6 +655,7 @@ public class SegmentFile implements Lifecycle<SegmentFileOptions> {
             final byte[] magicBytes = new byte[RECORD_MAGIC_BYTES_SIZE];
             this.buffer.get(magicBytes);
 
+            // 读取到的前两个 byte 不是魔数
             if (!Arrays.equals(RECORD_MAGIC_BYTES, magicBytes)) {
 
                 boolean truncateDirty = false;
@@ -655,6 +680,7 @@ public class SegmentFile implements Lifecycle<SegmentFileOptions> {
                     }
                 }
 
+                // 截断脏数据
                 if (truncateDirty) {
                     truncateFile(opts.sync);
                 } else {
@@ -703,6 +729,12 @@ public class SegmentFile implements Lifecycle<SegmentFileOptions> {
         return true;
     }
 
+    /**
+     * 将 wrotePos 之后的字节都写入 '0'
+     *
+     * @param sync
+     * @throws IOException
+     */
     private void truncateFile(final boolean sync) throws IOException {
         // Truncate dirty data.
         clear(this.wrotePos, sync);
@@ -746,6 +778,8 @@ public class SegmentFile implements Lifecycle<SegmentFileOptions> {
             this.wrotePos += RECORD_MAGIC_BYTES_SIZE + RECORD_DATA_LENGTH_SIZE + data.length;
             this.buffer.position(this.wrotePos);
             // Update log index.
+            // 更新此文件的 header，记录下 firstLogIndex
+            // 因为 header 这一页已经在创建 segmentFile 的时候预热过了，所以这次写入是纯内存的操作（而且不会 sync）
             if (isBlank() || pos == HEADER_SIZE) {
                 this.header.firstLogIndex = logIndex;
                 // we don't need to call fsync header here, the new header will be flushed with this wrote.
@@ -826,6 +860,7 @@ public class SegmentFile implements Lifecycle<SegmentFileOptions> {
     }
 
     private void swapInIfNeed() {
+        // 如果被置换出去了，就 swap 进来
         if (this.swappedOut) {
             swapIn();
         }
@@ -856,6 +891,7 @@ public class SegmentFile implements Lifecycle<SegmentFileOptions> {
     private void fsync(final MappedByteBuffer buffer) {
         if (buffer != null) {
             long startMs = Utils.monotonicMs();
+            // 强制刷盘（把脏页刷入到磁盘中）
             buffer.force();
             final long cost = Utils.monotonicMs() - startMs;
             if (cost >= FSYNC_COST_MS_THRESHOLD) {

@@ -775,6 +775,7 @@ public class Replicator implements ThreadId.OnError {
         final AppendEntriesRequest.Builder rb = AppendEntriesRequest.newBuilder();
         if (!fillCommonFields(rb, this.nextIndex - 1, isHeartbeat)) {
             // id is unlock in installSnapshot
+            // todo-wl 这个方法需要再看下
             installSnapshot();
             if (isHeartbeat && heartBeatClosure != null) {
                 RpcUtils.runClosureInThread(heartBeatClosure, new Status(RaftError.EAGAIN,
@@ -1553,6 +1554,7 @@ public class Replicator implements ThreadId.OnError {
 
     private boolean fillCommonFields(final AppendEntriesRequest.Builder rb, long prevLogIndex, final boolean isHeartbeat) {
         final long prevLogTerm = this.options.getLogManager().getTerm(prevLogIndex);
+        // 日志被压缩，如果是非心跳需要返回false，因为日志一致性需要有 preLogIndex + preLogTerm 一起保证的，压缩时无法保证
         if (prevLogTerm == 0 && prevLogIndex != 0) {
             if (!isHeartbeat) {
                 Requires.requireTrue(prevLogIndex < this.options.getLogManager().getFirstLogIndex());

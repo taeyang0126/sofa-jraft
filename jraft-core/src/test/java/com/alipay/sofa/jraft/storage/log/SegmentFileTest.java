@@ -64,6 +64,7 @@ public class SegmentFileTest extends BaseStorageTest {
     @Test
     public void testSwapInOut() throws Exception {
         testWriteRead();
+        // 设置为只读，只读的文件才能 swapOut
         this.segmentFile.setReadOnly(true);
         assertFalse(this.segmentFile.isSwappedOut());
         this.segmentFile.swapOut();
@@ -71,6 +72,7 @@ public class SegmentFileTest extends BaseStorageTest {
 
         int firstWritePos = SegmentFile.HEADER_SIZE;
 
+        // read 前会 swapIn
         assertEquals(32, this.segmentFile.read(0, firstWritePos).length);
         assertEquals(20, this.segmentFile.read(1, 38 + firstWritePos).length);
         assertFalse(this.segmentFile.isSwappedOut());
@@ -115,6 +117,7 @@ public class SegmentFileTest extends BaseStorageTest {
         assertArrayEquals(data, this.segmentFile.read(0, firstWritePos));
         assertTrue(this.segmentFile.reachesFileEndBy(SegmentFile.getWriteBytes(data)));
 
+        // 2 位的魔数 + 4 位的长度 + 32 位的数据 = 38
         final int nextWrotePos = 38 + SegmentFile.HEADER_SIZE;
         assertEquals(nextWrotePos, this.segmentFile.getWrotePos());
         assertEquals(nextWrotePos, this.segmentFile.getCommittedPos());
@@ -129,6 +132,7 @@ public class SegmentFileTest extends BaseStorageTest {
         assertNull(this.segmentFile.read(1, nextWrotePos));
         this.segmentFile.sync(true);
         assertArrayEquals(data2, this.segmentFile.read(1, nextWrotePos));
+        // 64 = 38 + 2 + 4 + 20
         assertEquals(64 + SegmentFile.HEADER_SIZE, this.segmentFile.getWrotePos());
         assertEquals(64 + SegmentFile.HEADER_SIZE, this.segmentFile.getCommittedPos());
         assertTrue(this.segmentFile.isFull());

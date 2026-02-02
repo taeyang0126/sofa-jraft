@@ -68,6 +68,7 @@ public class CounterServiceImpl implements CounterService {
                     closure.run(Status.OK());
                     return;
                 }
+                // 读取失败，可能是新当选的leader，commitIndex还不是最新的，需要新提交一个OP去推进commitIndex
                 CounterServiceImpl.this.readIndexExecutor.execute(() -> {
                     if(isLeader()){
                         LOG.debug("Fail to get value with 'ReadIndex': {}, try to applying to the state machine.", status);

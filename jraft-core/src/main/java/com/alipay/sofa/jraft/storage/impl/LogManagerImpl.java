@@ -335,6 +335,7 @@ public class LogManagerImpl implements LogManager {
         boolean doUnlock = true;
         this.writeLock.lock();
         try {
+            // 【leader】checkAndResolveConflict 中会给每个日志设置 index
             if (!entries.isEmpty() && !checkAndResolveConflict(entries, done, this.writeLock)) {
                 // If checkAndResolveConflict returns false, the done will be called in it.
                 entries.clear();
@@ -357,8 +358,9 @@ public class LogManagerImpl implements LogManager {
                 }
             }
             if (!entries.isEmpty()) {
+                // 设置这一批日志 firstLogIndex
                 done.setFirstLogIndex(entries.get(0).getId().getIndex());
-
+                // 添加到内存中
                 this.logsInMemory.addAll(entries);
             }
             done.setEntries(entries);
@@ -445,6 +447,7 @@ public class LogManagerImpl implements LogManager {
                     writtenSize += entry.getData() != null ? entry.getData().remaining() : 0;
                 }
                 this.nodeMetrics.recordSize("append-logs-bytes", writtenSize);
+                // 添加到实际的存储中
                 final int nAppent = this.logStorage.appendEntries(toAppend);
                 if (nAppent != entriesCount) {
                     LOG.error("**Critical error**, fail to appendEntries, nAppent={}, toAppend={}", nAppent,
@@ -506,6 +509,9 @@ public class LogManagerImpl implements LogManager {
         }
 
         void append(final StableClosure done) {
+            // 触发刷盘的两个条件：
+            // 1. 达到数量阈值 (256个closure)
+            // 2. 达到缓冲区大小阈值 (可配置的MaxAppendBufferSize)
             if (this.size == this.cap || this.bufferSize >= LogManagerImpl.this.raftOptions.getMaxAppendBufferSize()) {
                 flush();
             }
@@ -540,8 +546,10 @@ public class LogManagerImpl implements LogManager {
             event.reset();
 
             if (done.getEntries() != null && !done.getEntries().isEmpty()) {
+                // 普通日志（EventType.OTHER） -> 累积
                 this.ab.append(done);
             } else {
+                // 特殊操作：先刷已累积的
                 this.lastId = this.ab.flush();
                 boolean ret = true;
                 switch (eventType) {
@@ -1045,17 +1053,14 @@ public class LogManagerImpl implements LogManager {
     private boolean checkAndResolveConflict(final List<LogEntry> entries, final StableClosure done, final Lock lock) {
         final LogEntry firstLogEntry = ArrayDeque.peekFirst(entries);
         if (firstLogEntry.getId().getIndex() == 0) {
-            // Node is currently the leader and |entries| are from the user who
-            // don't know the correct indexes the logs should assign to. So we have
-            // to assign indexes to the appending entries
+            // 当前节点是领导者，而 |entries| 来自用户，用户不知道日志应该分配哪些正确的索引。
+            // 因此，我们必须为待添加的条目分配索引。
             for (int i = 0; i < entries.size(); i++) {
                 entries.get(i).getId().setIndex(++this.lastLogIndex);
             }
             return true;
         } else {
-            // Node is currently a follower and |entries| are from the leader. We
-            // should check and resolve the conflicts between the local logs and
-            // |entries|
+            // 当前节点是跟随者，|entries| 来自领导者。我们应该检查并解决本地日志与 |entries| 之间的冲突。
             if (firstLogEntry.getId().getIndex() > this.lastLogIndex + 1) {
                 ThreadPoolsFactory.runClosureInThread(this.groupId, done, new Status(RaftError.EINVAL,
                     "There's gap between first_index=%d and last_log_index=%d", firstLogEntry.getId().getIndex(),
@@ -1073,12 +1078,11 @@ public class LogManagerImpl implements LogManager {
                 return false;
             }
             if (firstLogEntry.getId().getIndex() == this.lastLogIndex + 1) {
+                // 日志索引匹配上了，当前追加的最新的日志就是此节点最新的日志
                 // fast path
                 this.lastLogIndex = lastLogEntry.getId().getIndex();
             } else {
-                // Appending entries overlap the local ones. We should find if there
-                // is a conflicting index from which we should truncate the local
-                // ones.
+                // 追加的条目会与本地条目重叠。我们需要找到是否存在冲突的索引，以便从该索引处截断本地条目。
                 int conflictingIndex = 0;
                 for (; conflictingIndex < entries.size(); conflictingIndex++) {
                     if (unsafeGetTerm(entries.get(conflictingIndex).getId().getIndex()) != entries
@@ -1088,6 +1092,7 @@ public class LogManagerImpl implements LogManager {
                 }
                 if (conflictingIndex != entries.size()) {
                     if (entries.get(conflictingIndex).getId().getIndex() <= this.lastLogIndex) {
+                        // <= this.lastLogIndex 表明本地日志有冲突，需要截断本地日志
                         // Truncate all the conflicting entries to make local logs
                         // consensus with the leader.
                         unsafeTruncateSuffix(entries.get(conflictingIndex).getId().getIndex() - 1, lock);
