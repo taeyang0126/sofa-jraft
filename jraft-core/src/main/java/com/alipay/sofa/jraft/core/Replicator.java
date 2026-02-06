@@ -608,6 +608,21 @@ public class Replicator implements ThreadId.OnError {
         return this.inflights.poll();
     }
 
+    /**
+     * 启动心跳超时定时器。
+     * 
+     * <p>工作流程：</p>
+     * <ol>
+     *   <li>计算到期时间：startMs + heartbeatTimeout</li>
+     *   <li>定时器到期后调用 {@link #onTimeout(ThreadId)}</li>
+     *   <li>{@link #onTimeout(ThreadId)} 设置 ETIMEDOUT 错误码</li>
+     *   <li>{@link ThreadId#setError(int)} 触发 {@link #onError(ThreadId, Object, int)} 回调</li>
+     *   <li>{@link #onError(ThreadId, Object, int)} 检测到 ETIMEDOUT 后调用 {@link #sendHeartbeat(ThreadId, RpcResponseClosure)}</li>
+     *   <li>{@link #sendHeartbeat(ThreadId, RpcResponseClosure)} → {@link #sendEmptyEntries(boolean, RpcResponseClosure)} 发送心跳</li>
+     * </ol>
+     * 
+     * @param startMs 启动时间戳
+     */
     private void startHeartbeatTimer(final long startMs) {
         final long dueTime = startMs + this.options.getDynamicHeartBeatTimeoutMs();
         try {
@@ -922,8 +937,10 @@ public class Replicator implements ThreadId.OnError {
         LOG.info("Replicator [group: {}, peer: {}, type: {}] is started", r.options.getGroupId(), r.options.getPeerId(), r.options.getReplicatorType());
         r.catchUpClosure = null;
         r.lastRpcSendTimestamp = Utils.monotonicMs();
+        // 启动心跳超时计时器
         r.startHeartbeatTimer(Utils.nowMs());
         // id.unlock in sendEmptyEntries
+        // 发送探测请求  Replicator 初始启动时不确定 Follower 的 nextIndex，发送探测请求（entries=0）来同步日志索引，确定从哪里开始发送
         r.sendProbeRequest();
         return r.id;
     }
@@ -993,6 +1010,25 @@ public class Replicator implements ThreadId.OnError {
         }
     }
 
+    /**
+     * 继续发送日志（由 {@link LogManager#wakeupAllWaiter()} 触发）。
+     * 
+     * <p>调用链路：</p>
+     * <p>Leader 写入新日志 → {@link LogManager#wakeupAllWaiter()} → 
+     * {@link LogManagerImpl#runOnNewLog(WaitMeta)} → 
+     * {@link WaitMeta#onNewLog#onNewLog(Object, int)}(wm.arg, SUCCESS) → {@link #continueSending(ThreadId, int)}</p>
+     * 
+     * <p>错误码处理：</p>
+     * <ul>
+     *   <li>{@code ETIMEDOUT}：超时，发送探测请求重新开始</li>
+     *   <li>{@code ESTOP}：停止，清理资源</li>
+     *   <li>其他（SUCCESS 等）：清除 waitId，调用 {@link #sendEntries()} 继续发送</li>
+     * </ul>
+     * 
+     * @param id Replicator 的 ThreadId
+     * @param errCode 错误码
+     * @return 是否成功处理
+     */
     static boolean continueSending(final ThreadId id, final int errCode) {
         if (id == null) {
             //It was destroyed already
@@ -1012,8 +1048,8 @@ public class Replicator implements ThreadId.OnError {
             r.sendProbeRequest();
         } else if (errCode != RaftError.ESTOP.getNumber()) {
         	// Only reset waitId before sending entries, fixed #842, #838
-        	r.waitId = -1;
-            // id is unlock in _send_entries
+            r.waitId = -1;
+            // id is unlock in _send_entries（sendEntries() 内部会解锁）
             r.sendEntries();
         } else {
             LOG.warn("Replicator {} stops sending entries.", id);
@@ -1091,6 +1127,7 @@ public class Replicator implements ThreadId.OnError {
                 r.destroy();
             }
         } else if (errorCode == RaftError.ETIMEDOUT.getNumber()) {
+            // 心跳超时 -> 发送心跳
             RpcUtils.runInThread(() -> sendHeartbeat(id));
         } else {
             // noinspection ConstantConditions
@@ -1144,6 +1181,19 @@ public class Replicator implements ThreadId.OnError {
         RpcUtils.runClosureInThread(savedClosure, savedClosure.getStatus());
     }
 
+    /**
+     * 心跳超时处理。
+     * 
+     * <p>注意：这里不直接发送心跳，而是通过设置错误码触发回调链路：</p>
+     * <ol>
+     *   <li>设置 ETIMEDOUT 错误码到 {@link ThreadId}</li>
+     *   <li>{@link ThreadId#setError(int)} 会调用 {@link #onError(ThreadId, Object, int)}</li>
+     *   <li>{@link #onError(ThreadId, Object, int)} 检测到 ETIMEDOUT 后调用 {@link #sendHeartbeat(ThreadId, RpcResponseClosure)}</li>
+     *   <li>{@link #sendHeartbeat(ThreadId, RpcResponseClosure)} → {@link #sendEmptyEntries(boolean, RpcResponseClosure)} 真正发送心跳</li>
+     * </ol>
+     * 
+     * @param id Replicator 的 ThreadId
+     */
     private void onTimeout(final ThreadId id) {
         if (id != null) {
             id.setError(RaftError.ETIMEDOUT.getNumber());
@@ -1260,6 +1310,34 @@ public class Replicator implements ThreadId.OnError {
         }
     }
 
+    /**
+     * RPC 响应的统一处理入口，支持请求管道化（Pipelining）。
+     *
+     * <p><b>核心职责</b>：
+     * <ul>
+     *   <li><b>版本控制</b>：丢弃状态版本过旧的响应，避免因异步返回导致状态回退。</li>
+     *   <li><b>响应排序</b>：将有效响应按序列号（seq）存入 {@code pendingResponses} 优先队列。</li>
+     *   <li><b>顺序交付</b>：仅当响应的 {@code seq} 等于 {@code requiredNextSeq} 时才处理，确保严格有序。</li>
+     *   <li><b>状态驱动</b>：根据响应结果更新复制状态，并决定是否继续发送后续日志条目（{@code continueSendEntries}）。</li>
+     * </ul>
+     *
+     * <p><b>序列号（seq）机制</b>：
+     * <ul>
+     *   <li>发送请求时：通过 {@code getAndIncrementReqSeq()} 分配唯一递增序列号。</li>
+     *   <li>处理响应时：仅当 {@code response.seq == requiredNextSeq} 时触发处理逻辑。</li>
+     *   <li>处理成功后：{@code requiredNextSeq} 自增，允许下一个响应被消费。</li>
+     * </ul>
+     *
+     * <p><b>参数说明</b>：
+     * @param id           Replicator 的线程 ID（ThreadId）
+     * @param reqType      请求类型（如 AppendEntries、InstallSnapshot 等）
+     * @param status       RPC 调用状态（成功/失败/超时等）
+     * @param request      原始请求头（用于上下文恢复或日志追踪）
+     * @param response     RPC 返回的响应消息体
+     * @param seq          本次请求的序列号（用于管道化顺序控制）
+     * @param stateVersion 当前状态机的版本号（用于防止旧响应干扰新状态）
+     * @param rpcSendTime  RPC 请求的发送时间戳（用于延迟统计或超时判断）
+     */
     @SuppressWarnings("ContinueOrBreakFromFinallyBlock")
     static void onRpcReturned(final ThreadId id, final RequestType reqType, final Status status, final RpcRequestHeader request,
                               final Message response, final int seq, final int stateVersion, final long rpcSendTime) {
@@ -1306,7 +1384,7 @@ public class Replicator implements ThreadId.OnError {
             while (!holdingQueue.isEmpty()) {
                 final RpcResponse queuedPipelinedResponse = holdingQueue.peek();
 
-                // Sequence mismatch, waiting for next response.
+                // 序列号不匹配，等待下一个响应到达（管道化可能乱序到达）
                 if (queuedPipelinedResponse.seq != r.requiredNextSeq) {
                     if (processed > 0) {
                         if (isLogDebugEnabled) {
@@ -1360,7 +1438,7 @@ public class Replicator implements ThreadId.OnError {
                     }
                 } finally {
                     if (continueSendEntries) {
-                        // Success, increase the response sequence.
+                        // Success, increase the response sequence
                         r.getAndIncrementRequiredNextSeq();
                     } else {
                         // The id is already unlocked in onAppendEntriesReturned/onInstallSnapshotReturned, we SHOULD break out.
@@ -1393,10 +1471,40 @@ public class Replicator implements ThreadId.OnError {
         releaseReader();
     }
 
+    /**
+     * 处理 AppendEntries 响应。
+     * 
+     * <p>返回值含义：</p>
+     * <ul>
+     *   <li>{@code true}：继续发送（continueSendEntries=true，onRpcReturned 会调用 {@link #sendEntries()}）</li>
+     *   <li>{@code false}：停止发送（continueSendEntries=false，已内部处理解锁）</li>
+     * </ul>
+     * 
+     * <p>处理流程：</p>
+     * <ol>
+     *   <li>验证请求/响应一致性（inflight.startIndex == request.prevLogIndex + 1）</li>
+     *   <li>检查 RPC 状态（失败则 {@link #block(long, int)}）</li>
+     *   <li>检查 response.success：</li>
+     *   <ul>
+     *     <li>{@code false}：日志不匹配，回退 nextIndex，重新探测</li>
+     *     <li>{@code true}：成功提交日志，递增 nextIndex，返回 true 继续发送</li>
+     *   </ul>
+     * </ol>
+     * 
+     * @param id Replicator 的 ThreadId
+     * @param inflight In-flight 记录
+     * @param status RPC 状态
+     * @param request 原始请求
+     * @param response AppendEntries 响应
+     * @param rpcSendTime RPC 发送时间
+     * @param startTimeMs 开始处理时间
+     * @param r Replicator 实例
+     * @return 是否继续发送
+     */
     private static boolean onAppendEntriesReturned(final ThreadId id, final Inflight inflight, final Status status,
-                                                   final RpcRequestHeader request,
-                                                   final AppendEntriesResponse response, final long rpcSendTime,
-                                                   final long startTimeMs, final Replicator r) {
+                                                    final RpcRequestHeader request,
+                                                    final AppendEntriesResponse response, final long rpcSendTime,
+                                                    final long startTimeMs, final Replicator r) {
         if (inflight.startIndex != request.getPrevLogIndex() + 1) {
             LOG.warn(
                 "Replicator {} received invalid AppendEntriesResponse, in-flight startIndex={}, request prevLogIndex={}, reset the replicator state and probe again.",
@@ -1545,7 +1653,6 @@ public class Replicator implements ThreadId.OnError {
         r.nextIndex += entriesSize;
         r.hasSucceeded = true;
         r.notifyOnCaughtUp(RaftError.SUCCESS.getNumber(), false);
-        // dummy_id is unlock in _send_entries
         if (r.timeoutNowIndex > 0 && r.timeoutNowIndex < r.nextIndex) {
             r.sendTimeoutNow(false, false);
         }
@@ -1579,6 +1686,28 @@ public class Replicator implements ThreadId.OnError {
         return true;
     }
 
+    /**
+     * 等待更多日志条目可用。
+     * 
+     * <p>调用时机：{@link #sendEntries()} 发现 entriesCount == 0（没有日志可发送）</p>
+     * 
+     * <p>注册流程：</p>
+     * <ol>
+     *   <li>调用 {@link LogManager#wait(long, NewLogCallback, Object)}</li>
+     *   <li>{@link LogManager} 将 WaitMeta 放入 waitMap（key=waitId）</li>
+     *   <li>Replicator 进入 IDLE 状态，等待被唤醒</li>
+     * </ol>
+     * 
+     * <p>唤醒流程：</p>
+     * <ol>
+     *   <li>Leader 写入新日志 → {@link LogManager#wakeupAllWaiter()}</li>
+     *   <li>{@code waitMap.clear()} 清空所有等待者</li>
+     *   <li>遍历所有 WaitMeta，调用 callback</li>
+     *   <li>callback → {@link #continueSending(ThreadId, int)} → {@link #sendEntries()} 重新尝试发送</li>
+     * </ol>
+     * 
+     * @param nextWaitIndex 下一个要发送的日志索引
+     */
     private void waitMoreEntries(final long nextWaitIndex) {
         try {
             LOG.debug("Node {} waits more entries", this.options.getNode().getNodeId());
@@ -1594,7 +1723,26 @@ public class Replicator implements ThreadId.OnError {
     }
 
     /**
-     * Send as many requests as possible.
+     * 尽可能多地发送日志条目请求。
+     * 
+     * <p>工作流程：</p>
+     * <ol>
+     *   <li>while 循环持续发送，直到：</li>
+     *   <ul>
+     *     <li>getNextSendIndex() 返回 -1（达到 in-flight 限制）</li>
+     *     <li>nextSendingIndex <= prevSendIndex（没有更多日志）</li>
+     *   </ul>
+     *   <li>调用 {@link #sendEntries(long)} 发送一个批次</li>
+     *   <li>如果 entriesCount == 0（没有日志）→ {@link #waitMoreEntries(long)} 注册等待</li>
+     *   <li>如果有日志 → 发送 AppendEntries RPC</li>
+     * </ol>
+     * 
+     * <p>调用时机：</p>
+     * <ol>
+     *   <li>探测响应成功：onAppendEntriesReturned() → sendEntries()</li>
+     *   <li>被唤醒后：continueSending(id, SUCCESS) → sendEntries()</li>
+     *   <li>block timeout：onBlockTimeout() → sendEntries()</li>
+     * </ol>
      */
     void sendEntries() {
         boolean doUnlock = true;
@@ -1729,6 +1877,26 @@ public class Replicator implements ThreadId.OnError {
         r.sendEmptyEntries(true);
     }
 
+    /**
+     * 发送探测请求（不包含日志条目）。
+     * 
+     * <p>调用时机：</p>
+     * <ol>
+     *   <li>Replicator 启动时（start() 第 929 行）</li>
+     *   <li>探测响应失败，需要重新探测时</li>
+     *   <li>日志不匹配，需要回退 nextIndex 时</li>
+     * </ol>
+     * 
+     * <p>作用：</p>
+     * <ul>
+     *   <li>确定 Follower 的 lastLogIndex</li>
+     *   <li>携帶 prevLogIndex=nextIndex-1, prevLogTerm=getTerm(nextIndex-1)</li>
+     *   <li>entriesCount=0（不包含日志）</li>
+     *   <li>Follower 根据匹配情况返回成功/失败</li>
+     * </ul>
+     * 
+     * <p>注意：调用 {@link #sendEmptyEntries(boolean, RpcResponseClosure)}，不是直接调用 {@link #sendEntries()}</p>
+     */
     private void sendProbeRequest() {
         sendEmptyEntries(false);
     }

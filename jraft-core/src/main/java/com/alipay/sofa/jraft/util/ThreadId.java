@@ -121,6 +121,7 @@ public class ThreadId {
                 LOG.warn("ThreadId: {} already destroyed, ignore error code: {}", this.data, errorCode);
                 return;
             }
+            // 根据异常码进行处理
             if (this.onError != null) {
                 this.onError.onError(this, this.data, errorCode);
             }

@@ -1274,6 +1274,7 @@ public class NodeImpl implements Node, RaftServerService {
                 continue;
             }
             LOG.debug("Node {} add a replicator, term={}, peer={}.", getNodeId(), this.currTerm, peer);
+            // 为每个 Follower 创建 Replicator
             if (!this.replicatorGroup.addReplicator(peer)) {
                 LOG.error("Fail to add a replicator, peer={}.", peer);
             }
@@ -2106,6 +2107,7 @@ public class NodeImpl implements Node, RaftServerService {
 
             final FollowerStableClosure closure = new FollowerStableClosure(request, AppendEntriesResponse.newBuilder()
                 .setTerm(this.currTerm), this, done, this.currTerm);
+            // follower 节点添加日志
             this.logManager.appendEntries(entries, closure);
             // update configuration after _log_manager updated its memory status
             checkAndSetConfiguration(true);

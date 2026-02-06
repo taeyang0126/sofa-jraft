@@ -1,0 +1,15 @@
+{
+  "enabled": true,
+  "name": "安全审查 - 敏感信息检测",
+  "description": "手动触发安全审查，全面检测代码中的 API 密钥、令牌、凭据、私钥、加密密钥、身份验证令牌、会话 ID、配置文件密码、敏感 IP 地址、硬编码 URL、数据库凭据、硬编码端口号、哈希盐值、调试标志和不安全的随机数生成器等安全风险",
+  "version": "1",
+  "when": {
+    "type": "userTriggered"
+  },
+  "then": {
+    "type": "askAgent",
+    "prompt": "请对最近修改的文件进行全面的安全审查，排查以下潜在的安全问题：\n\n**核心安全检查项：**\n1. **API 密钥和令牌**：检查源代码中是否包含 API 密钥、访问令牌（access tokens）、OAuth tokens 或其他凭据\n2. **私钥和证书**：查找私钥（private keys）、加密密钥、证书文件或密钥库（keystore）密码\n3. **身份验证信息**：识别身份验证令牌、会话 ID、JWT tokens 或 cookie secrets\n4. **配置文件密码**：标记配置文件中的密码、机密信息（secrets）或敏感配置项\n5. **敏感网络信息**：检测包含敏感数据的 IP 地址、硬编码的内部 URL 或服务端点\n6. **数据库凭据**：发现数据库连接字符串、用户名、密码或 JDBC URLs\n7. **硬编码端口号**：识别硬编码的端口号（特别是非标准端口）\n8. **哈希盐值**：查找明文存储的哈希盐值（salt）或加密种子\n9. **调试模式标志**：检测生产代码中的调试模式开关（如 debug=true, verbose=true）\n10. **不安全的随机数**：识别使用 java.util.Random 而非 SecureRandom 的安全敏感场景\n\n**审查规则：**\n- 跳过测试文件（src/test/）中的模拟数据和测试凭据\n- 忽略注释中的示例代码\n- 关注 .java、.properties、.yaml、.yml、.xml、.conf、.config 等文件\n- 对于超大文件（>5000行），重点检查配置相关部分\n\n**输出要求：**\n对于发现的每一项问题，请：\n- 明确指出具体的安全风险、所在文件和行号\n- 评估风险等级（高/中/低）\n- 建议采用更安全的替代方案：\n  * 环境变量（System.getenv()）\n  * 配置中心（如 Apollo、Nacos）\n  * 密钥管理服务（如 Vault、KMS）\n  * Spring 加密属性\n- 推荐相关的安全最佳实践和 SOFAJRaft 项目规范\n\n如果没有发现安全问题，简单确认即可。请用中文回复。"
+  },
+  "workspaceFolderName": "sofa-jraft",
+  "shortName": "security-review-hook"
+}

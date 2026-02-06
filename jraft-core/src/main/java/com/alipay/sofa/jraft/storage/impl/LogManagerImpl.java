@@ -366,6 +366,7 @@ public class LogManagerImpl implements LogManager {
             done.setEntries(entries);
 
             doUnlock = false;
+            // 唤醒所有等待者
             if (!wakeupAllWaiter(this.writeLock)) {
                 notifyLastLogIndexListeners();
             }
@@ -484,7 +485,9 @@ public class LogManagerImpl implements LogManager {
 
         LogId flush() {
             if (this.size > 0) {
+                // 添加到底层存储 -> 这里会同步等待添加完成(是否刷新到磁盘需要看具体的配置)
                 this.lastId = appendToStorage(this.toAppend);
+                // 处理回调（注意这里相当于一个节点追加日志完成）
                 for (int i = 0; i < this.size; i++) {
                     this.storage.get(i).getEntries().clear();
                     Status st = null;
@@ -494,6 +497,8 @@ public class LogManagerImpl implements LogManager {
                         } else {
                             st = Status.OK();
                         }
+                        // 执行回调
+                        // 对于 com.alipay.sofa.jraft.Node.apply 来说这里的回调是 com.alipay.sofa.jraft.core.NodeImpl.LeaderStableClosure.run
                         this.storage.get(i).run(st);
                     } catch (Throwable t) {
                         LOG.error("Fail to run closure with status: {}.", st, t);
@@ -908,6 +913,7 @@ public class LogManagerImpl implements LogManager {
         if (entry != null) {
             return entry.getId().getTerm();
         }
+        // 从底层存储中获取
         return getTermFromLogStorage(index);
     }
 

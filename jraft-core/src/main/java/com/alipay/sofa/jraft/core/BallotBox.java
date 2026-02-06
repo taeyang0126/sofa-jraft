@@ -220,7 +220,7 @@ public class BallotBox implements Lifecycle<BallotBoxOptions>, Describer {
             // 以下两个队列按相同顺序存储，索引一一对应
             // 2. 将 Ballot 加入投票队列（与日志条目一一对应）
             this.pendingMetaQueue.add(bl);
-            // 3. 将用户的回调闭包加入回调队列
+            // 3. 将用户的回调闭包加入回调队列（这里是 task 的回调）
             this.closureQueue.appendPendingClosure(done);
             return true;
         } finally {
